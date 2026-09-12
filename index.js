@@ -7,8 +7,12 @@ const express = require("express");
 const admin = require("firebase-admin");
 const cors = require("cors");
 
-// Load service account từ ENV hoặc file
-let serviceAccount;
+// ======================================================
+// LOAD SERVICE ACCOUNT (ENV hoặc file)
+// ======================================================
+let serviceAccount = null;
+
+// 1. Thử load từ ENV (dùng trên Render/production)
 if (process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON) {
   try {
     serviceAccount = JSON.parse(
@@ -16,17 +20,31 @@ if (process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON) {
     );
     console.log("✅ Load service account từ ENV");
   } catch (e) {
-    console.error("❌ ENV không phải JSON hợp lệ");
+    console.error(
+      "❌ ENV GOOGLE_APPLICATION_CREDENTIALS_JSON không phải JSON hợp lệ:",
+      e.message,
+    );
     process.exit(1);
   }
-} else {
+}
+// 2. Fallback: đọc từ file (dùng khi dev local)
+else {
   try {
     serviceAccount = require("./serviceAccountKey.json");
     console.log("✅ Load service account từ file");
   } catch (e) {
     console.error("❌ Không tìm thấy service account");
+    console.error(
+      "👉 Trên Render: set ENV GOOGLE_APPLICATION_CREDENTIALS_JSON",
+    );
+    console.error("👉 Trên local: tạo file serviceAccountKey.json");
     process.exit(1);
   }
+}
+
+// Fix private_key bị escape \n khi truyền qua ENV
+if (serviceAccount.private_key && serviceAccount.private_key.includes("\\n")) {
+  serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, "\n");
 }
 
 // Khởi tạo Firebase Admin
@@ -39,7 +57,6 @@ const db = admin.firestore();
 // Khởi tạo Express
 const app = express();
 
-// Cho phép CORS từ mọi domain (để client gọi API)
 app.use(
   cors({
     origin: "*",
@@ -48,12 +65,11 @@ app.use(
   }),
 );
 
-app.use(express.json());
+app.use(express.json({ limit: "1mb" }));
 
 // ======================================================
 // API: GỬI THÔNG BÁO
 // POST /api/notify
-// Body: { chatId, senderNickname, messageText, recipientUids, senderUid }
 // ======================================================
 app.post("/api/notify", async (req, res) => {
   try {
@@ -78,10 +94,10 @@ app.post("/api/notify", async (req, res) => {
       });
     }
 
-    // Lấy tất cả FCM tokens của những người nhận
+    // Lấy tất cả FCM tokens của người nhận
     const allTokens = [];
     for (const uid of recipientUids) {
-      if (uid === senderUid) continue; // Không gửi cho chính người gửi
+      if (uid === senderUid) continue;
 
       try {
         const tokensSnap = await db
@@ -105,7 +121,6 @@ app.post("/api/notify", async (req, res) => {
       return res.json({ success: true, sent: 0, message: "Không có token" });
     }
 
-    // Chuẩn bị payload
     const payload = {
       notification: {
         title: senderNickname || "Tin nhắn mới",
@@ -129,7 +144,6 @@ app.post("/api/notify", async (req, res) => {
       },
     };
 
-    // Gửi đến từng token
     const tokenStrings = allTokens.map((t) => t.token);
     let successCount = 0;
     let failureCount = 0;
@@ -139,16 +153,12 @@ app.post("/api/notify", async (req, res) => {
       const response = await admin
         .messaging()
         .sendToDevice(tokenStrings, payload);
-
       successCount = response.successCount;
       failureCount = response.failureCount;
 
-      // Xoá các token không còn hợp lệ
       response.results.forEach((result, index) => {
         if (!result.success) {
           const error = result.error;
-          console.warn(`Token ${index} lỗi:`, error?.code);
-
           if (
             error &&
             (error.code === "messaging/invalid-registration-token" ||
@@ -159,7 +169,7 @@ app.post("/api/notify", async (req, res) => {
         }
       });
 
-      // Xoá token lỗi khỏi Firestore
+      // Xoá token lỗi
       for (const { uid, token } of invalidTokens) {
         try {
           await db
@@ -193,8 +203,7 @@ app.post("/api/notify", async (req, res) => {
 });
 
 // ======================================================
-// API: KIỂM TRA SERVER ĐANG CHẠY
-// GET /
+// API: KIỂM TRA SERVER
 // ======================================================
 app.get("/", (req, res) => {
   res.send(`
