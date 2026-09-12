@@ -1,6 +1,5 @@
 // ======================================================
-// SERVER GỬI THÔNG BÁO FCM
-// Nhận yêu cầu từ client → gửi push notification
+// SERVER GỬI THÔNG BÁO FCM + TĂNG UNREAD
 // ======================================================
 
 const express = require("express");
@@ -8,11 +7,10 @@ const admin = require("firebase-admin");
 const cors = require("cors");
 
 // ======================================================
-// LOAD SERVICE ACCOUNT (ENV hoặc file)
+// LOAD SERVICE ACCOUNT
 // ======================================================
 let serviceAccount = null;
 
-// 1. Thử load từ ENV (dùng trên Render/production)
 if (process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON) {
   try {
     serviceAccount = JSON.parse(
@@ -20,41 +18,28 @@ if (process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON) {
     );
     console.log("✅ Load service account từ ENV");
   } catch (e) {
-    console.error(
-      "❌ ENV GOOGLE_APPLICATION_CREDENTIALS_JSON không phải JSON hợp lệ:",
-      e.message,
-    );
+    console.error("❌ ENV không hợp lệ:", e.message);
     process.exit(1);
   }
-}
-// 2. Fallback: đọc từ file (dùng khi dev local)
-else {
+} else {
   try {
     serviceAccount = require("./serviceAccountKey.json");
     console.log("✅ Load service account từ file");
   } catch (e) {
     console.error("❌ Không tìm thấy service account");
-    console.error(
-      "👉 Trên Render: set ENV GOOGLE_APPLICATION_CREDENTIALS_JSON",
-    );
-    console.error("👉 Trên local: tạo file serviceAccountKey.json");
     process.exit(1);
   }
 }
 
-// Fix private_key bị escape \n khi truyền qua ENV
 if (serviceAccount.private_key && serviceAccount.private_key.includes("\\n")) {
   serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, "\n");
 }
 
-// Khởi tạo Firebase Admin
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
 });
 
 const db = admin.firestore();
-
-// Khởi tạo Express
 const app = express();
 
 app.use(
@@ -68,18 +53,26 @@ app.use(
 app.use(express.json({ limit: "1mb" }));
 
 // ======================================================
-// API: GỬI THÔNG BÁO
+// API: GỬI THÔNG BÁO + TĂNG UNREAD
 // POST /api/notify
+// Body: { chatId, chatType, senderNickname, senderUid, messageText, recipientUids }
 // ======================================================
 app.post("/api/notify", async (req, res) => {
   try {
-    const { chatId, senderNickname, messageText, recipientUids, senderUid } =
-      req.body;
-
-    console.log("📨 Nhận yêu cầu gửi thông báo:", {
+    const {
       chatId,
+      chatType,
       senderNickname,
-      recipientCount: recipientUids ? recipientUids.length : 0,
+      senderUid,
+      messageText,
+      recipientUids,
+    } = req.body;
+
+    console.log("📨", {
+      chatId,
+      chatType,
+      senderNickname,
+      recipients: recipientUids ? recipientUids.length : 0,
     });
 
     if (
@@ -87,40 +80,60 @@ app.post("/api/notify", async (req, res) => {
       !Array.isArray(recipientUids) ||
       recipientUids.length === 0
     ) {
-      return res.json({
-        success: true,
-        sent: 0,
-        message: "Không có người nhận",
-      });
+      return res.json({ success: true, sent: 0, unread: 0 });
     }
 
-    // Lấy tất cả FCM tokens của người nhận
+    // ==========================================
+    // 1. TĂNG UNREAD COUNT CHO NGƯỜI NHẬN
+    // ==========================================
+    let unreadUpdated = 0;
+    for (const uid of recipientUids) {
+      if (uid === senderUid) continue;
+      try {
+        const unreadRef = db
+          .collection("users")
+          .doc(uid)
+          .collection("unread")
+          .doc(chatId);
+
+        await db.runTransaction(async (tx) => {
+          const doc = await tx.get(unreadRef);
+          const count = doc.exists ? doc.data().count || 0 : 0;
+          tx.set(unreadRef, { count: count + 1 }, { merge: true });
+        });
+
+        unreadUpdated++;
+      } catch (e) {
+        console.warn(`Unread fail cho ${uid}:`, e.message);
+      }
+    }
+
+    // ==========================================
+    // 2. LẤY TOKENS FCM
+    // ==========================================
     const allTokens = [];
     for (const uid of recipientUids) {
       if (uid === senderUid) continue;
-
       try {
         const tokensSnap = await db
           .collection("users")
           .doc(uid)
           .collection("tokens")
           .get();
-
         tokensSnap.forEach((doc) => {
           const token = doc.data().token;
-          if (token) {
-            allTokens.push({ uid, token });
-          }
+          if (token) allTokens.push({ uid, token });
         });
-      } catch (e) {
-        console.warn(`Không lấy được tokens cho ${uid}:`, e.message);
-      }
+      } catch (e) {}
     }
 
     if (allTokens.length === 0) {
-      return res.json({ success: true, sent: 0, message: "Không có token" });
+      return res.json({ success: true, sent: 0, unread: unreadUpdated });
     }
 
+    // ==========================================
+    // 3. GỬI PUSH NOTIFICATION
+    // ==========================================
     const payload = {
       notification: {
         title: senderNickname || "Tin nhắn mới",
@@ -128,6 +141,7 @@ app.post("/api/notify", async (req, res) => {
       },
       data: {
         chatId: String(chatId || ""),
+        chatType: String(chatType || ""),
         senderUid: String(senderUid || ""),
         type: "new_message",
       },
@@ -138,16 +152,13 @@ app.post("/api/notify", async (req, res) => {
           tag: chatId || "chat-msg",
           renotify: true,
         },
-        fcmOptions: {
-          link: "/",
-        },
+        fcmOptions: { link: "/" },
       },
     };
 
     const tokenStrings = allTokens.map((t) => t.token);
     let successCount = 0;
     let failureCount = 0;
-    const invalidTokens = [];
 
     try {
       const response = await admin
@@ -156,20 +167,21 @@ app.post("/api/notify", async (req, res) => {
       successCount = response.successCount;
       failureCount = response.failureCount;
 
+      // Xoá token lỗi
+      const invalidTokens = [];
       response.results.forEach((result, index) => {
         if (!result.success) {
-          const error = result.error;
+          const err = result.error;
           if (
-            error &&
-            (error.code === "messaging/invalid-registration-token" ||
-              error.code === "messaging/registration-token-not-registered")
+            err &&
+            (err.code === "messaging/invalid-registration-token" ||
+              err.code === "messaging/registration-token-not-registered")
           ) {
             invalidTokens.push(allTokens[index]);
           }
         }
       });
 
-      // Xoá token lỗi
       for (const { uid, token } of invalidTokens) {
         try {
           await db
@@ -178,51 +190,46 @@ app.post("/api/notify", async (req, res) => {
             .collection("tokens")
             .doc(token)
             .delete();
-          console.log(`🗑️ Đã xoá token lỗi của ${uid}`);
         } catch (e) {}
       }
     } catch (sendError) {
-      console.error("Lỗi gửi FCM:", sendError);
-      return res.status(500).json({ success: false, error: sendError.message });
+      console.error("FCM error:", sendError);
     }
 
     console.log(
-      `✅ Đã gửi: ${successCount} thành công, ${failureCount} thất bại`,
+      `✅ Sent: ${successCount}, Failed: ${failureCount}, Unread: ${unreadUpdated}`,
     );
 
     res.json({
       success: true,
       sent: successCount,
       failed: failureCount,
-      total: allTokens.length,
+      unread: unreadUpdated,
     });
   } catch (error) {
-    console.error("❌ Lỗi server:", error);
+    console.error("❌ Server error:", error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
 // ======================================================
-// API: KIỂM TRA SERVER
+// API kiểm tra
 // ======================================================
 app.get("/", (req, res) => {
   res.send(`
     <html>
       <body style="font-family:sans-serif;padding:40px;background:#0f0f1a;color:#f0f0f0;">
         <h1>✅ Chat Notification Server</h1>
-        <p>Server đang chạy bình thường.</p>
-        <p><b>Endpoint:</b> POST /api/notify</p>
+        <p>Server đang chạy.</p>
+        <p>Endpoint: POST /api/notify</p>
         <p>Thời gian: ${new Date().toLocaleString("vi-VN")}</p>
       </body>
     </html>
   `);
 });
 
-// ======================================================
-// KHỞI ĐỘNG SERVER
-// ======================================================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`🚀 Server đang chạy trên port ${PORT}`);
+  console.log(`🚀 Server chạy port ${PORT}`);
   console.log(`📡 Endpoint: http://localhost:${PORT}/api/notify`);
 });
