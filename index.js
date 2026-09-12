@@ -7,16 +7,26 @@ const express = require("express");
 const admin = require("firebase-admin");
 const cors = require("cors");
 
-// Import service account key (tải từ Firebase Console)
+// Load service account từ ENV hoặc file
 let serviceAccount;
-try {
-  serviceAccount = require("./serviceAccountKey.json");
-} catch (e) {
-  console.error("❌ Không tìm thấy serviceAccountKey.json");
-  console.error(
-    "👉 Hãy tải file này từ Firebase Console → Project Settings → Service Accounts → Generate new private key",
-  );
-  process.exit(1);
+if (process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON) {
+  try {
+    serviceAccount = JSON.parse(
+      process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON,
+    );
+    console.log("✅ Load service account từ ENV");
+  } catch (e) {
+    console.error("❌ ENV không phải JSON hợp lệ");
+    process.exit(1);
+  }
+} else {
+  try {
+    serviceAccount = require("./serviceAccountKey.json");
+    console.log("✅ Load service account từ file");
+  } catch (e) {
+    console.error("❌ Không tìm thấy service account");
+    process.exit(1);
+  }
 }
 
 // Khởi tạo Firebase Admin
