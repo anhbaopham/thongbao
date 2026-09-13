@@ -1,5 +1,6 @@
 // ======================================================
 // SERVER GỬI THÔNG BÁO FCM + TĂNG UNREAD
+// Dùng sendEachForMulticast (HTTP v1 API)
 // ======================================================
 
 const express = require("express");
@@ -53,9 +54,8 @@ app.use(
 app.use(express.json({ limit: "1mb" }));
 
 // ======================================================
-// API: GỬI THÔNG BÁO + TĂNG UNREAD
+// API: GỬI THÔNG BÁO
 // POST /api/notify
-// Body: { chatId, chatType, senderNickname, senderUid, messageText, recipientUids }
 // ======================================================
 app.post("/api/notify", async (req, res) => {
   try {
@@ -84,7 +84,7 @@ app.post("/api/notify", async (req, res) => {
     }
 
     // ==========================================
-    // 1. TĂNG UNREAD COUNT CHO NGƯỜI NHẬN
+    // 1. TĂNG UNREAD COUNT
     // ==========================================
     let unreadUpdated = 0;
     for (const uid of recipientUids) {
@@ -109,7 +109,7 @@ app.post("/api/notify", async (req, res) => {
     }
 
     // ==========================================
-    // 2. LẤY TOKENS FCM
+    // 2. LẤY TOKENS
     // ==========================================
     const allTokens = [];
     for (const uid of recipientUids) {
@@ -128,13 +128,16 @@ app.post("/api/notify", async (req, res) => {
     }
 
     if (allTokens.length === 0) {
+      console.log("⚠️ Không có FCM token nào");
       return res.json({ success: true, sent: 0, unread: unreadUpdated });
     }
 
+    const tokenStrings = allTokens.map((t) => t.token);
+
     // ==========================================
-    // 3. GỬI PUSH NOTIFICATION
+    // 3. BUILD MESSAGE (đúng format HTTP v1)
     // ==========================================
-    const payload = {
+    const message = {
       notification: {
         title: senderNickname || "Tin nhắn mới",
         body: messageText || "Bạn có tin nhắn mới",
@@ -149,35 +152,48 @@ app.post("/api/notify", async (req, res) => {
         notification: {
           icon: "/icon-192.png",
           badge: "/icon-192.png",
-          tag: chatId || "chat-msg",
+          tag: String(chatId || "chat-msg"),
           renotify: true,
         },
-        fcmOptions: { link: "/" },
+        fcmOptions: {
+          link: "/",
+        },
       },
     };
 
-    const tokenStrings = allTokens.map((t) => t.token);
+    // ==========================================
+    // 4. GỬI BẰNG sendEachForMulticast (HTTP v1 API)
+    // ==========================================
     let successCount = 0;
     let failureCount = 0;
 
     try {
-      const response = await admin
-        .messaging()
-        .sendToDevice(tokenStrings, payload);
+      const response = await admin.messaging().sendEachForMulticast({
+        ...message,
+        tokens: tokenStrings,
+      });
+
       successCount = response.successCount;
       failureCount = response.failureCount;
 
+      console.log(
+        `📤 Kết quả: ${successCount} thành công / ${failureCount} thất bại`,
+      );
+
       // Xoá token lỗi
       const invalidTokens = [];
-      response.results.forEach((result, index) => {
-        if (!result.success) {
-          const err = result.error;
+      response.responses.forEach((resp, idx) => {
+        if (!resp.success) {
+          const err = resp.error;
+          const errCode = err && err.code;
+          console.warn(`Token ${idx} lỗi:`, errCode);
+
           if (
-            err &&
-            (err.code === "messaging/invalid-registration-token" ||
-              err.code === "messaging/registration-token-not-registered")
+            errCode === "messaging/invalid-registration-token" ||
+            errCode === "messaging/registration-token-not-registered" ||
+            errCode === "messaging/invalid-argument"
           ) {
-            invalidTokens.push(allTokens[index]);
+            invalidTokens.push(allTokens[idx]);
           }
         }
       });
@@ -190,10 +206,12 @@ app.post("/api/notify", async (req, res) => {
             .collection("tokens")
             .doc(token)
             .delete();
+          console.log(`🗑 Đã xoá token lỗi của ${uid}`);
         } catch (e) {}
       }
     } catch (sendError) {
-      console.error("FCM error:", sendError);
+      console.error("❌ FCM send error:", sendError.message);
+      failureCount = allTokens.length;
     }
 
     console.log(
@@ -205,6 +223,7 @@ app.post("/api/notify", async (req, res) => {
       sent: successCount,
       failed: failureCount,
       unread: unreadUpdated,
+      total: allTokens.length,
     });
   } catch (error) {
     console.error("❌ Server error:", error);
